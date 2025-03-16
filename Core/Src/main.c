@@ -55,6 +55,10 @@ enum cal_state_enum {
 /* USER CODE BEGIN PD */
 
 #define DISP_CHAR_COUNT     4
+#define DISP_STR_LEN        5
+
+#define RNG_SEL_LOW         0
+#define RNG_SEL_HIGH        1
 
 #define RFL_PWR_LO_RNG_MUX  ADS1220_MUX_P0_NVSS
 #define RFL_PWR_HI_RNG_MUX  ADS1220_MUX_P1_NVSS
@@ -71,6 +75,8 @@ enum cal_state_enum {
 
 #define VREF_IDEAL          4.096
 
+#define ADC_RDG_MAX         3.85
+#define RNG_SEL_HYST        0.05
 #define CAL_POINTS          26
 #define FLASH_FLAG          0xA5A5A5A5
 #define UART_RX_WORD_SIZE   4
@@ -107,6 +113,10 @@ static const uint8_t seven_seg_lut[12][7] = {
 };
 
 uint8_t disp_char_sel = 0;
+uint8_t disp1_str_ind = 0;
+uint8_t disp2_str_ind = 0;
+uint8_t disp_1_str[DISP_STR_LEN + 1] = {};
+uint8_t disp_2_str[DISP_STR_LEN + 1] = {};
 uint8_t disp_1_values[DISP_CHAR_COUNT] = {0};
 uint8_t disp_2_values[DISP_CHAR_COUNT] = {0};
 bool update_disp_vals = false;
@@ -114,10 +124,12 @@ bool update_disp_vals = false;
 Ads1220_t adc;
 bool adc_drdy_flag = false;
 uint8_t last_adc_mux = ADC_INIT_MUX_SET;
-float fwd_hi_det_offset = 0.05;
-float fwd_lo_det_offset = 0.05;
-float rfl_hi_det_offset = 0.05;
-float rfl_lo_det_offset = 0.05;
+uint8_t fwd_rng_sel = RNG_SEL_LOW;
+uint8_t rfl_rng_sel = RNG_SEL_LOW;
+float fwd_hi_det_offset = 0.02;
+float fwd_lo_det_offset = 0.02;
+float rfl_hi_det_offset = 0.02;
+float rfl_lo_det_offset = 0.02;
 
 uint8_t cal_state = CAL_DEFAULT;
 int cal_step = 0;
@@ -134,7 +146,7 @@ float rfl_lo_rng_v = 0.0;
 float fwd_pwr = 0.0;
 float rfl_pwr = 0.0;
 float vswr = 0.0;
-float dir_coupler_factor_db = 20.0;
+float dir_coupler_factor = 900.0; // 30 turns, 29.54...dB
 
 /* USER CODE END PV */
 
@@ -143,6 +155,10 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 
 void set_adc_cs(int state);
+void set_disp_1_pins(int value, bool dp_on);
+void set_disp_2_pins(int value, bool dp_on);
+void select_disp_char(int sel);
+float get_cal_power(float value, CalPoint_t* cal_data);
 
 /* USER CODE END PFP */
 
@@ -206,24 +222,24 @@ int main(void)
     cal_state = CAL_GOOD;
   } else {
     /* write some default calibration values to ram */
-    float voltage = 0.005;
-    float power = -26.0;
+    float voltage = 0.0;
+    float v_step = ADC_RDG_MAX / (CAL_POINTS - 1);
     for (int i = 0; i < CAL_POINTS; i++) {
+      float power_tmp = 0.2579*voltage + 2.064e-4;
       fwd_lo_rng_cal[i].reading = voltage;
-      fwd_lo_rng_cal[i].value = power;
+      fwd_lo_rng_cal[i].value = power_tmp;
       rfl_lo_rng_cal[i].reading = voltage;
-      rfl_lo_rng_cal[i].value = power;
-      voltage += 0.125;
-      power += 1.0;
+      rfl_lo_rng_cal[i].value = power_tmp;
+      voltage += 0.15;
     }
-    voltage = 0.01;
+    voltage = 0.0;
     for (int i = 0; i < CAL_POINTS; i++) {
+      float power_tmp = 29.71*voltage + 6.962e-2;
       fwd_hi_rng_cal[i].reading = voltage;
-      fwd_hi_rng_cal[i].value = power;
+      fwd_hi_rng_cal[i].value = power_tmp;
       rfl_hi_rng_cal[i].reading = voltage;
-      rfl_hi_rng_cal[i].value = power;
-      voltage += 0.125;
-      power += 1.0;
+      rfl_hi_rng_cal[i].value = power_tmp;
+      voltage += 0.15;
     }
   }
 
@@ -262,22 +278,22 @@ int main(void)
           break;
         }
         case FWD_PWR_LO_RNG_MUX: {
-          fwd_lo_rng_v = adc_rdg - fwd_lo_det_offset;
+          fwd_lo_rng_v = adc_rdg;
           next_adc_mux = FWD_PWR_HI_RNG_MUX;
           break;
         }
         case FWD_PWR_HI_RNG_MUX: {
-          fwd_hi_rng_v = adc_rdg - fwd_hi_det_offset;
+          fwd_hi_rng_v = adc_rdg;
           next_adc_mux = RFL_PWR_LO_RNG_MUX;
           break;
         }
         case RFL_PWR_LO_RNG_MUX: {
-          rfl_lo_rng_v = adc_rdg - rfl_lo_det_offset;
+          rfl_lo_rng_v = adc_rdg;
           next_adc_mux = RFL_PWR_HI_RNG_MUX;
           break;
         }
         case RFL_PWR_HI_RNG_MUX: {
-          rfl_hi_rng_v = adc_rdg - rfl_hi_det_offset;
+          rfl_hi_rng_v = adc_rdg;
           update_disp_vals = true;
           next_adc_mux = FWD_PWR_LO_RNG_MUX;
           break;
@@ -287,6 +303,21 @@ int main(void)
       ads_start_sync(&adc);
 
       if (update_disp_vals) {
+        // make decisions on which range to use for power computations
+        if (fwd_rng_sel == RNG_SEL_LOW && fwd_lo_rng_v > (ADC_RDG_MAX + RNG_SEL_HYST)) {
+          fwd_rng_sel = RNG_SEL_HIGH;
+        }
+        else if (fwd_rng_sel == RNG_SEL_HIGH && fwd_lo_rng_v < (ADC_RDG_MAX - RNG_SEL_HYST)) {
+          fwd_rng_sel = RNG_SEL_LOW;
+        }
+
+        if (fwd_rng_sel == RNG_SEL_LOW) {
+          fwd_pwr = dir_coupler_factor * get_cal_power(fwd_lo_rng_v - fwd_lo_det_offset, fwd_lo_rng_cal);
+        }
+        else {
+          fwd_pwr = dir_coupler_factor * get_cal_power(fwd_hi_rng_v - fwd_hi_det_offset, fwd_hi_rng_cal);
+        }
+
         // TODO: compute power and VSWR
         static char scratch[16];
         snprintf(scratch, 16, "%05.2f", fwd_pwr);
@@ -350,12 +381,121 @@ void set_adc_cs(int state) {
   HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, state & 1);
 }
 
+
+void set_disp_1_pins(int value, bool dp_on) {
+  if (value == ('-' - 48)) {
+    value = 11; // LUT index of the hyphen
+  }  else if (value >= 12 || value < 0) {
+    value = 10; // blank
+  } 
+
+  uint8_t* segment = seven_seg_lut[value];
+  HAL_GPIO_WritePin(DISP1_A_GPIO_Port, DISP1_A_Pin, segment[0]);
+  HAL_GPIO_WritePin(DISP1_B_GPIO_Port, DISP1_B_Pin, segment[1]);
+  HAL_GPIO_WritePin(DISP1_C_GPIO_Port, DISP1_C_Pin, segment[2]);
+  HAL_GPIO_WritePin(DISP1_D_GPIO_Port, DISP1_D_Pin, segment[3]);
+  HAL_GPIO_WritePin(DISP1_E_GPIO_Port, DISP1_E_Pin, segment[4]);
+  HAL_GPIO_WritePin(DISP1_F_GPIO_Port, DISP1_F_Pin, segment[5]);
+  HAL_GPIO_WritePin(DISP1_G_GPIO_Port, DISP1_G_Pin, segment[6]);
+  HAL_GPIO_WritePin(DISP1_DP_GPIO_Port, DISP1_DP_Pin, dp_on);
+}
+
+
+void set_disp_2_pins(int value, bool dp_on) {
+  if (value == ('-' - 48)) {
+    value = 11; // LUT index of the hyphen
+  }  else if (value >= 12 || value < 0) {
+    value = 10; // blank
+  } 
+
+  uint8_t* segment = seven_seg_lut[value];
+  HAL_GPIO_WritePin(DISP2_A_GPIO_Port, DISP2_A_Pin, segment[0]);
+  HAL_GPIO_WritePin(DISP2_B_GPIO_Port, DISP2_B_Pin, segment[1]);
+  HAL_GPIO_WritePin(DISP2_C_GPIO_Port, DISP2_C_Pin, segment[2]);
+  HAL_GPIO_WritePin(DISP2_D_GPIO_Port, DISP2_D_Pin, segment[3]);
+  HAL_GPIO_WritePin(DISP2_E_GPIO_Port, DISP2_E_Pin, segment[4]);
+  HAL_GPIO_WritePin(DISP2_F_GPIO_Port, DISP2_F_Pin, segment[5]);
+  HAL_GPIO_WritePin(DISP2_G_GPIO_Port, DISP2_G_Pin, segment[6]);
+  HAL_GPIO_WritePin(DISP2_DP_GPIO_Port, DISP2_DP_Pin, dp_on);
+}
+
+
+/**
+ * Select which character of the displays to turn on. A value outside 0
+ * through 3 will disable all displays
+ */
+void select_disp_char(int sel) {
+  uint8_t bits = 0;
+  if (sel >= 0 && sel < DISP_CHAR_COUNT) {
+    bits = (1 << sel);
+  }
+  HAL_GPIO_WritePin(CHAR_1_GPIO_Port, CHAR_1_Pin, (bits >> 0) & 1);
+  HAL_GPIO_WritePin(CHAR_2_GPIO_Port, CHAR_2_Pin, (bits >> 1) & 1);
+  HAL_GPIO_WritePin(CHAR_3_GPIO_Port, CHAR_3_Pin, (bits >> 2) & 1);
+  HAL_GPIO_WritePin(CHAR_4_GPIO_Port, CHAR_4_Pin, (bits >> 3) & 1);
+}
+
+
+/**
+ * Calculate power based on the provided voltage value and calibration data.
+ */
+float get_cal_power(float rdg, CalPoint_t* cal_data) {
+  int upper = CAL_POINTS;
+  int lower = 0;
+  int i;
+  CalPoint_t* a;
+  CalPoint_t* b;
+  bool found = false;
+  while (!found) {
+    i = (int)((upper - lower) / 2) + lower;
+
+    if (i <= 1) {
+      break;
+    }
+    a = cal_data + (i - 1);
+    b = cal_data + i;
+    found = ((rdg > a->reading) && (rdg <= b->reading));
+    if (!found) {
+      if (rdg <= a->reading) {
+        // shift search range down
+        upper = i;
+      }
+      else if (rdg > b->reading) {
+        // shift search range up
+        lower = i;
+      }
+    }
+  }
+  float slope = (b->value - a->value)/(b->reading - a->reading);
+  return a->value + (slope * (rdg - a->reading));
+}
+
+
 /**
  * My implementation of timer callback
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
-  HAL_UART_Receive_DMA(&huart1, uart_data, UART_RX_WORD_SIZE);
+  char disp1_char = disp_1_str[disp1_str_ind];
+  disp1_str_ind++;
+  bool disp1_dp_on = false;
+  if (disp_1_str[disp1_str_ind] == '.') {
+    disp1_dp_on = true;
+    disp1_str_ind++; // ensure next time, we're pointing at a character rather than a decimal point
+  }
+
+  char disp2_char = disp_2_str[disp2_str_ind];
+  disp2_str_ind++;
+  bool disp2_dp_on = false;
+  if (disp_2_str[disp2_str_ind] == '.') {
+    disp2_dp_on = true;
+    disp2_str_ind++; // ensure next time, we're pointing at a character rather than a decimal point
+  }
+
+
+  if (disp_char_sel >= DISP_CHAR_COUNT) {
+    disp_char_sel = 0;
+  }
 }
 
 /**
