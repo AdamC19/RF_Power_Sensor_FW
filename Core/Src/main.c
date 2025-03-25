@@ -133,6 +133,7 @@ float rfl_lo_det_offset = 0.02;
 
 uint8_t cal_state = CAL_DEFAULT;
 int cal_step = 0;
+CalPoint_t cal_data_tmp[CAL_POINTS];
 CalPoint_t fwd_hi_rng_cal[CAL_POINTS];
 CalPoint_t fwd_lo_rng_cal[CAL_POINTS];
 CalPoint_t rfl_hi_rng_cal[CAL_POINTS];
@@ -492,7 +493,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     disp2_str_ind++; // ensure next time, we're pointing at a character rather than a decimal point
   }
 
+  select_disp_char(-1);
+  set_disp_1_pins(disp1_char, disp1_dp_on);
+  set_disp_2_pins(disp2_char, disp2_dp_on);
+  select_disp_char(disp_char_sel);
 
+  disp_char_sel++;
   if (disp_char_sel >= DISP_CHAR_COUNT) {
     disp_char_sel = 0;
   }
@@ -526,23 +532,46 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
       cal_state = CAL_GOOD;
     } 
     else {
+      /* no other match, so this must be calibration data */
+      CalPoint_t* cal = NULL;
+      int cal_ind = 0;
+      float reading = 0.0;
       if (cal_step < CAL_POINTS) {
         /* calibrating FWD_LO_RNG */
+        cal = fwd_lo_rng_cal;
+        cal_ind = cal_step;
+        reading = fwd_lo_rng_v; // whatever the last value was
       }
       else if (cal_step < 2*CAL_POINTS) {
         /* calibrating FWD_HI_RNG */
+        cal = fwd_hi_rng_cal;
+        cal_ind = cal_step - CAL_POINTS;
+        reading = fwd_hi_rng_v; // whatever the last value was
       }
       else if (cal_step < 3*CAL_POINTS) {
         /* calibrating RFL_LO_RNG */
+        cal = rfl_lo_rng_cal;
+        cal_ind = cal_step - 2*CAL_POINTS;
+        reading = rfl_lo_rng_v; // whatever the last value was
       }
       else if (cal_step < 4*CAL_POINTS) {
         /* calibrating RFL_HI_RNG */
-      } else {
-        cal_step = 0; /* at this point, calibration should end anyway */
+        cal = rfl_hi_rng_cal;
+        cal_ind = cal_step - 3*CAL_POINTS;
+        reading = rfl_hi_rng_v; // whatever the last value was
       }
-
-
       cal_step++;
+
+      if (cal_step >= 4*CAL_POINTS) {
+        cal_step = 0;
+      }
+      
+      if (cal != NULL) {
+        cal[cal_ind].reading = reading;
+        float value = 0.0;
+        memcpy(&value, uart_data, sizeof(value));
+        cal[cal_ind].value = value;
+      }
     }
   }
 
